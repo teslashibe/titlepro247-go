@@ -1,0 +1,8 @@
+*.test
+*.out
+*.cover
+.idea/
+.vscode/
+.DS_Store
+config.json
+*.local.json
