@@ -3,8 +3,8 @@ package mcp
 import (
 	"context"
 
-	tp "github.com/teslashibe/titlepro247-go"
 	"github.com/teslashibe/mcptool"
+	tp "github.com/teslashibe/titlepro247-go"
 )
 
 // LoginInput is the typed input for titlepro247_login.
