@@ -2,6 +2,7 @@ package titlepro247
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -80,7 +81,9 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 	// the cookie only on success, never cache it — perpetuating the churn).
 	// GetMe is best-effort here, purely to enrich DisplayName.
 	u := &User{LoggedIn: true}
-	if me, err := c.GetMe(ctx); err == nil && me != nil && me.DisplayName != "" {
+	// Best-effort enrichment only. Use getMeRaw (NOT GetMe) so a logged-out
+	// bounce here can't trigger relogin → recurse back into Login.
+	if me, err := c.getMeRaw(ctx); err == nil && me != nil && me.DisplayName != "" {
 		u.DisplayName = me.DisplayName
 	}
 	return u, nil
@@ -92,16 +95,35 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 // today is the welcome line.
 var welcomeNameRe = regexp.MustCompile(`(?is)<title>\s*([^<]+?)\s*</title>`)
 
-// GetMe fetches /Account and confirms the cached cookie is alive.
+// GetMe fetches /Account and confirms the cached session is alive,
+// self-healing an evicted session: if the stored cookie has been bumped
+// (single-session backend) it drops it, logs in fresh, and retries once.
+// This matters because the agent typically calls get_me first — without
+// self-heal a stale persisted cookie would leave it permanently "expired".
 //
-// Liveness is detected by the ABSENCE of the login form rather than the
-// presence of a "logout" link. A logged-out request to /Account 302s to
-// /Home?ReturnUrl=/Account, which renders the sign-in form (a UserName
-// field); the authenticated Account page has no such field. The old
-// "contains 'logout'" heuristic was brittle — its markup/casing varies and
-// it false-negatived on perfectly valid sessions, making Login (which ends
-// by calling GetMe) report "session expired" right after a successful login.
+// It delegates to getMeRaw, which Login also uses (best-effort, for
+// DisplayName). Login must NOT call the self-healing GetMe or it would
+// recurse (GetMe → relogin → Login → GetMe → …); the relogin path calls
+// getMeRaw instead.
 func (c *Client) GetMe(ctx context.Context) (*User, error) {
+	u, err := c.getMeRaw(ctx)
+	if errors.Is(err, ErrUnauthorized) && c.canRelogin() {
+		c.invalidateAuth()
+		if lerr := c.relogin(ctx); lerr != nil {
+			return nil, lerr
+		}
+		u, err = c.getMeRaw(ctx)
+	}
+	return u, err
+}
+
+// getMeRaw fetches /Account once (no self-heal). Liveness is detected by the
+// ABSENCE of the login form rather than the presence of a "logout" link: a
+// logged-out request to /Account 302s to /Home?ReturnUrl=/Account, which
+// renders the sign-in form (a UserName field); the authenticated Account page
+// has no such field. (The old "contains 'logout'" heuristic was brittle and
+// false-negatived valid sessions.)
+func (c *Client) getMeRaw(ctx context.Context) (*User, error) {
 	body, _, err := c.getBytes(ctx, "/Account", nil)
 	if err != nil {
 		return nil, fmt.Errorf("GetMe: %w", err)
