@@ -82,20 +82,30 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 var welcomeNameRe = regexp.MustCompile(`(?is)<title>\s*([^<]+?)\s*</title>`)
 
 // GetMe fetches /Account and confirms the cached cookie is alive.
+//
+// Liveness is detected by the ABSENCE of the login form rather than the
+// presence of a "logout" link. A logged-out request to /Account 302s to
+// /Home?ReturnUrl=/Account, which renders the sign-in form (a UserName
+// field); the authenticated Account page has no such field. The old
+// "contains 'logout'" heuristic was brittle — its markup/casing varies and
+// it false-negatived on perfectly valid sessions, making Login (which ends
+// by calling GetMe) report "session expired" right after a successful login.
 func (c *Client) GetMe(ctx context.Context) (*User, error) {
 	body, _, err := c.getBytes(ctx, "/Account", nil)
 	if err != nil {
 		return nil, fmt.Errorf("GetMe: %w", err)
 	}
 	html := string(body)
-	loggedIn := strings.Contains(strings.ToLower(html), "logout")
+	low := strings.ToLower(html)
+	hasLoginForm := strings.Contains(low, `name="username"`) || strings.Contains(low, `id="username"`)
+	loggedIn := !hasLoginForm
 
 	u := &User{LoggedIn: loggedIn}
 	if m := welcomeNameRe.FindStringSubmatch(html); len(m) > 1 {
 		u.DisplayName = strings.TrimSpace(m[1])
 	}
 	if !loggedIn {
-		return u, fmt.Errorf("%w: /Account does not show a Logout link", ErrUnauthorized)
+		return u, fmt.Errorf("%w: /Account redirected to the sign-in form", ErrUnauthorized)
 	}
 	return u, nil
 }
