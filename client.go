@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"time"
@@ -111,11 +112,21 @@ func (c *Client) canRelogin() bool {
 	return c.auth.Username != "" && c.auth.Password != ""
 }
 
-// invalidateAuth clears the cached session cookie so the next ensureLoggedIn
-// / relogin mints a fresh one.
+// invalidateAuth clears the cached session cookie AND resets the cookie jar
+// so the next relogin starts from a clean slate. The jar reset is essential:
+// a rejected request (stale/garbage cookie) leaves cookies in the jar that
+// net/http auto-appends to every subsequent request, layered on top of the
+// explicit Cookie header we build — duplicating/poisoning .SiteXPro_AUTH so
+// even a freshly minted session reads as logged-out. Wiping the jar makes
+// re-login behave exactly like a clean first login.
 func (c *Client) invalidateAuth() {
 	c.authMu.Lock()
 	c.auth.AuthCookie = ""
+	if c.httpClient != nil {
+		if jar, err := cookiejar.New(nil); err == nil {
+			c.httpClient.Jar = jar
+		}
+	}
 	c.authMu.Unlock()
 }
 
