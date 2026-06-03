@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -131,11 +132,6 @@ func (c *Client) invalidateAuth() {
 }
 
 func (c *Client) doRequest(ctx context.Context, method, rawURL string, body []byte, contentType string) ([]byte, int, error) {
-	c.waitForGap(ctx)
-	if ctx.Err() != nil {
-		return nil, 0, ctx.Err()
-	}
-
 	var bodyReader io.Reader
 	if body != nil {
 		bodyReader = bytes.NewReader(body)
@@ -145,7 +141,18 @@ func (c *Client) doRequest(ctx context.Context, method, rawURL string, body []by
 		return nil, 0, fmt.Errorf("%w: %v", ErrRequestFailed, err)
 	}
 	c.setCommonHeaders(req, contentType)
+	return c.execute(ctx, req)
+}
 
+// execute runs an already-built request through the rate-limit gate and maps
+// the response (cookie capture, sign-in-redirect detection, status switch).
+// Split out of doRequest so callers that need custom headers (the PDV JSON
+// API: X-Requested-With + anti-forgery token) can share the same handling.
+func (c *Client) execute(ctx context.Context, req *http.Request) ([]byte, int, error) {
+	c.waitForGap(ctx)
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", ErrRequestFailed, err)
@@ -200,31 +207,36 @@ func (c *Client) setCommonHeaders(req *http.Request, contentType string) {
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	if cookie := c.cookieString(); cookie != "" {
-		req.Header.Set("Cookie", cookie)
-	}
+	// Cookies are carried by the http.Client's jar, NOT a manual Cookie
+	// header. Setting both made net/http append jar cookies on top of the
+	// manual header, sending .SiteXPro_AUTH twice — which the SiteX
+	// /Areas/PDV backend rejects (bouncing to sign-in) even on a valid
+	// session. seedJar() ensures a stored/minted cookie is in the jar.
 }
 
-func (c *Client) cookieString() string {
-	var parts []string
+// seedJar injects the cached .SiteXPro_AUTH cookie into the http.Client's jar
+// so it travels with requests like any browser cookie. This is how a STORED
+// cookie (supplied via Auth.AuthCookie, e.g. the host's persisted session)
+// reaches the server — a fresh login already populates the jar directly. We
+// rely on the jar exclusively (no manual Cookie header) to avoid duplicate
+// cookies that the SiteX backend rejects.
+func (c *Client) seedJar() {
 	c.authMu.RLock()
-	if c.auth.AuthCookie != "" {
-		parts = append(parts, ".SiteXPro_AUTH="+c.auth.AuthCookie)
-	}
+	cookie := c.auth.AuthCookie
 	c.authMu.RUnlock()
-	if c.httpClient != nil && c.httpClient.Jar != nil {
-		u, _ := url.Parse(baseURL)
-		for _, ck := range c.httpClient.Jar.Cookies(u) {
-			if ck.Name == ".SiteXPro_AUTH" {
-				continue
-			}
-			if ck.Value == "" {
-				continue
-			}
-			parts = append(parts, ck.Name+"="+ck.Value)
-		}
+	if cookie == "" || c.httpClient == nil || c.httpClient.Jar == nil {
+		return
 	}
-	return strings.Join(parts, "; ")
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return
+	}
+	c.httpClient.Jar.SetCookies(u, []*http.Cookie{{
+		Name:   ".SiteXPro_AUTH",
+		Value:  cookie,
+		Path:   "/",
+		Domain: u.Hostname(),
+	}})
 }
 
 func (c *Client) captureAuthCookie(resp *http.Response) {
@@ -235,6 +247,90 @@ func (c *Client) captureAuthCookie(resp *http.Response) {
 			c.auth.AuthCookie = ck.Value
 		}
 	}
+}
+
+func isUnauthorized(err error) bool { return errors.Is(err, ErrUnauthorized) }
+
+// antiForgeryRe matches ASP.NET's hidden anti-forgery field in either
+// attribute order.
+var (
+	antiForgeryRe  = regexp.MustCompile(`name="__RequestVerificationToken"[^>]*\bvalue="([^"]+)"`)
+	antiForgeryRe2 = regexp.MustCompile(`\bvalue="([^"]+)"[^>]*name="__RequestVerificationToken"`)
+)
+
+// antiForgeryToken fetches the PDV page so the server sets the
+// __RequestVerificationToken cookie (captured by the jar) and returns the
+// matching hidden-field token to send as the request header. Best-effort:
+// returns "" on any failure; the caller still attempts the request.
+func (c *Client) antiForgeryToken(ctx context.Context) string {
+	body, _, err := c.getBytes(ctx, "/PDV", nil)
+	if err != nil {
+		return ""
+	}
+	if m := antiForgeryRe.FindSubmatch(body); len(m) > 1 {
+		return string(m[1])
+	}
+	if m := antiForgeryRe2.FindSubmatch(body); len(m) > 1 {
+		return string(m[1])
+	}
+	return ""
+}
+
+// getJSONWithToken issues an XHR-style GET to a JSON API path, attaching the
+// anti-forgery header and X-Requested-With. The PDV API answers an
+// unauthenticated request with HTTP 200 + {"Message":"Authorization has been
+// denied for this request."} rather than a 401, so we detect that body and
+// surface it as ErrUnauthorized (lets SearchAddress self-heal).
+func (c *Client) getJSONWithToken(ctx context.Context, rawPath, token string) ([]byte, int, error) {
+	build := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+rawPath, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
+		}
+		c.setCommonHeaders(req, "")
+		req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		if token != "" {
+			req.Header.Set("__RequestVerificationToken", token)
+		}
+		return req, nil
+	}
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			case <-time.After(c.backoff(attempt)):
+			}
+		}
+		req, err := build()
+		if err != nil {
+			return nil, 0, err
+		}
+		raw, status, err := c.execute(ctx, req)
+		if err != nil {
+			lastErr = err
+			if errors.Is(err, ErrRateLimited) {
+				continue
+			}
+			var httpErr *HTTPError
+			if errors.As(err, &httpErr) && httpErr.StatusCode >= 500 {
+				continue
+			}
+			return nil, status, err
+		}
+		if isAuthDeniedBody(raw) {
+			return nil, status, ErrUnauthorized
+		}
+		return raw, status, nil
+	}
+	return nil, 0, lastErr
+}
+
+// isAuthDeniedBody detects the API's soft 200 auth rejection.
+func isAuthDeniedBody(raw []byte) bool {
+	return len(raw) < 200 && strings.Contains(string(raw), "Authorization has been denied")
 }
 
 func (c *Client) backoff(attempt int) time.Duration {

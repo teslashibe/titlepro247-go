@@ -27,7 +27,23 @@ func getPath(ctx context.Context, c *tp.Client, in GetPathInput) (any, error) {
 	return map[string]any{"path": in.Path, "html": html}, nil
 }
 
+// SearchAddressInput is the typed input for titlepro247_search_address.
+type SearchAddressInput struct {
+	Address      string `json:"address" jsonschema:"description=Street line e.g. '27 Vista Way',required"`
+	CityStateZip string `json:"city_state_zip" jsonschema:"description=City and/or state/ZIP e.g. 'Fairfax' or 'Fairfax, CA 94930'"`
+}
+
+func searchAddress(ctx context.Context, c *tp.Client, in SearchAddressInput) (any, error) {
+	return c.SearchAddress(ctx, in.Address, in.CityStateZip)
+}
+
 var pageTools = []mcptool.Tool{
+	mcptool.Define[*tp.Client, SearchAddressInput](
+		"titlepro247_search_address",
+		"Look up a property by street address; returns matching parcels (owner, APN, location) from the PDV property database.",
+		"SearchAddress",
+		searchAddress,
+	),
 	mcptool.Define[*tp.Client, GetAccountSummaryInput](
 		"titlepro247_get_account_summary",
 		"Fetch a normalized snapshot of the /Account dashboard page (URL, status, title, byte size).",

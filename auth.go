@@ -73,6 +73,11 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 	if cookie == "" {
 		return nil, fmt.Errorf("%w: server did not set .SiteXPro_AUTH", ErrLoginFailed)
 	}
+	// Login posts with redirects disabled to capture the cookie cleanly, so
+	// the 302's .SiteXPro_AUTH lands in c.auth but not always in the jar.
+	// Since requests now carry auth via the jar (no manual Cookie header),
+	// seed it explicitly so the freshly minted session actually travels.
+	c.seedJar()
 	// The 302 → /Account plus a freshly set .SiteXPro_AUTH cookie is the
 	// authoritative success signal. We deliberately do NOT gate success on a
 	// follow-up GetMe: under the single-session backend a competing login can

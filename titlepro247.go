@@ -2,7 +2,7 @@
 // v3.titlepro247.com (TitlePro247, an ICE/SiteX product). There is no
 // public API; this is reverse-engineered from the website.
 //
-// Authentication
+// # Authentication
 //
 // The website posts UserName + Password to /Index.aspx and receives a
 // 302 → /Account plus a long-lived first-party cookie named
@@ -91,6 +91,9 @@ func New(auth Auth, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(c)
 	}
+	// A stored cookie (Auth.AuthCookie, e.g. the host's persisted session)
+	// must live in the jar to be sent; a fresh login populates the jar itself.
+	c.seedJar()
 	return c, nil
 }
 
