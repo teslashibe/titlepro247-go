@@ -37,8 +37,10 @@ type Client struct {
 	gapMu     sync.Mutex
 	lastReqAt time.Time
 
-	loginOnce sync.Once
-	loginErr  error
+	// loginMu serializes (re)login so concurrent requests on the same
+	// client don't trigger a thundering herd of logins against the
+	// single-session backend.
+	loginMu sync.Mutex
 
 	authMu sync.RWMutex
 }

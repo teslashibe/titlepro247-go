@@ -10,7 +10,7 @@ var titleRe = regexp.MustCompile(`(?is)<title>\s*(.*?)\s*</title>`)
 
 // GetAccountSummary fetches /Account and returns a normalized envelope.
 func (c *Client) GetAccountSummary(ctx context.Context) (*AccountPage, error) {
-	body, status, err := c.getBytes(ctx, "/Account", nil)
+	body, status, err := c.getBytesHealing(ctx, "/Account", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +43,7 @@ func (c *Client) GetAccountSummary(ctx context.Context) (*AccountPage, error) {
 // This is the catch-all reader; agents call it directly to get any
 // authenticated page until per-area typed parsers are written.
 func (c *Client) GetPath(ctx context.Context, path string) (string, error) {
-	body, _, err := c.getBytes(ctx, path, nil)
+	body, _, err := c.getBytesHealing(ctx, path, nil)
 	if err != nil {
 		return "", err
 	}

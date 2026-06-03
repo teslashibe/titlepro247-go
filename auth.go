@@ -72,7 +72,18 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 	if cookie == "" {
 		return nil, fmt.Errorf("%w: server did not set .SiteXPro_AUTH", ErrLoginFailed)
 	}
-	return c.GetMe(ctx)
+	// The 302 → /Account plus a freshly set .SiteXPro_AUTH cookie is the
+	// authoritative success signal. We deliberately do NOT gate success on a
+	// follow-up GetMe: under the single-session backend a competing login can
+	// briefly bounce /Account to the sign-in form, which would make a
+	// genuinely-successful login report failure (and, because callers persist
+	// the cookie only on success, never cache it — perpetuating the churn).
+	// GetMe is best-effort here, purely to enrich DisplayName.
+	u := &User{LoggedIn: true}
+	if me, err := c.GetMe(ctx); err == nil && me != nil && me.DisplayName != "" {
+		u.DisplayName = me.DisplayName
+	}
+	return u, nil
 }
 
 // userNameRe pulls the first occurrence of a known display name from

@@ -29,6 +29,26 @@ func (c *Client) makeRequest(ctx context.Context, method, rawURL string, body []
 	return c.doRetried(ctx, method, rawURL, body, contentType)
 }
 
+// getBytesHealing is getBytes plus self-healing for an evicted session.
+// TitlePro/SiteX allows one active session per account, so another login
+// (the user's browser, or a concurrent request) can evict ours; the cached
+// .SiteXPro_AUTH then bounces to the sign-in form (ErrUnauthorized). On that,
+// drop the cookie, log in fresh, and retry once. Only username/password
+// clients can recover. This is deliberately NOT in makeRequest/GetMe: Login
+// ends by calling GetMe, so self-healing there would recurse
+// (relogin → Login → GetMe → relogin → …).
+func (c *Client) getBytesHealing(ctx context.Context, path string, query url.Values) ([]byte, int, error) {
+	raw, status, err := c.getBytes(ctx, path, query)
+	if errors.Is(err, ErrUnauthorized) && c.canRelogin() {
+		c.invalidateAuth()
+		if lerr := c.relogin(ctx); lerr != nil {
+			return nil, 0, lerr
+		}
+		raw, status, err = c.getBytes(ctx, path, query)
+	}
+	return raw, status, err
+}
+
 func (c *Client) doRetried(ctx context.Context, method, rawURL string, body []byte, contentType string) ([]byte, int, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
@@ -64,10 +84,39 @@ func (c *Client) ensureLoggedIn(ctx context.Context) error {
 	if has {
 		return nil
 	}
-	c.loginOnce.Do(func() {
-		_, c.loginErr = c.Login(ctx)
-	})
-	return c.loginErr
+	return c.relogin(ctx)
+}
+
+// relogin performs a login, serialized so concurrent callers on the same
+// client don't each fire one. A double-check inside the lock means only the
+// first waiter logs in; the rest see the freshly-set cookie and return.
+func (c *Client) relogin(ctx context.Context) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	c.authMu.RLock()
+	has := c.auth.AuthCookie != ""
+	c.authMu.RUnlock()
+	if has {
+		return nil
+	}
+	_, err := c.Login(ctx)
+	return err
+}
+
+// canRelogin reports whether the client has username/password to mint a new
+// session (vs a cookie-only client, which cannot recover an evicted session).
+func (c *Client) canRelogin() bool {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.auth.Username != "" && c.auth.Password != ""
+}
+
+// invalidateAuth clears the cached session cookie so the next ensureLoggedIn
+// / relogin mints a fresh one.
+func (c *Client) invalidateAuth() {
+	c.authMu.Lock()
+	c.auth.AuthCookie = ""
+	c.authMu.Unlock()
 }
 
 func (c *Client) doRequest(ctx context.Context, method, rawURL string, body []byte, contentType string) ([]byte, int, error) {
@@ -97,6 +146,16 @@ func (c *Client) doRequest(ctx context.Context, method, rawURL string, body []by
 		return nil, resp.StatusCode, fmt.Errorf("%w: reading body: %v", ErrRequestFailed, err)
 	}
 	c.captureAuthCookie(resp)
+
+	// Auth gate: a logged-out request to an authenticated path 302s to the
+	// sign-in flow (…/Home?ReturnUrl=<path> or /Index?ReturnUrl=…), which the
+	// client follows to a 200 login page. Detect that final landing by the
+	// ReturnUrl query the gate appends, and surface it as ErrUnauthorized so
+	// makeRequest can re-login and retry. (Status alone can't tell us — the
+	// login page is HTTP 200.)
+	if u := resp.Request.URL; u != nil && u.Query().Get("ReturnUrl") != "" {
+		return nil, resp.StatusCode, ErrUnauthorized
+	}
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusCreated, http.StatusNoContent,
