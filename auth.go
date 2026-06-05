@@ -22,6 +22,12 @@ import (
 // lived .SiteXPro_AUTH cookie. We disable redirect-following so the
 // cookie capture happens before any follow-up GET races.
 func (c *Client) Login(ctx context.Context) (*User, error) {
+	// Cap the aggregate wall-clock time across login's own transient retries
+	// (and the best-effort getMeRaw enrichment) so a hard-down upstream can't
+	// stack per-attempt 60s timeouts into minutes. A tighter caller deadline
+	// still wins. See WithMaxTotalWait.
+	ctx, cancel := c.capContext(ctx)
+	defer cancel()
 	c.authMu.RLock()
 	user := c.auth.Username
 	pass := c.auth.Password
@@ -42,7 +48,7 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 	// layer, and rotating to a fresh sticky session is exactly what recovers
 	// it. Bounded by the configured rotation budget (no-op when unproxied).
 	buildReq := func() (*http.Request, error) {
-		r, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+loginPath,
+		r, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+loginPath,
 			strings.NewReader(form.Encode()))
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidParams, err)
@@ -147,6 +153,12 @@ var welcomeNameRe = regexp.MustCompile(`(?is)<title>\s*([^<]+?)\s*</title>`)
 // recurse (GetMe → relogin → Login → GetMe → …); the relogin path calls
 // getMeRaw instead.
 func (c *Client) GetMe(ctx context.Context) (*User, error) {
+	// Bound the total time across getMeRaw + a possible self-heal (relogin →
+	// Login, which retries on its own) so the layered per-attempt 60s timeouts
+	// cannot stack into minutes against a hard-down upstream. A tighter caller
+	// deadline still wins. See WithMaxTotalWait.
+	ctx, cancel := c.capContext(ctx)
+	defer cancel()
 	u, err := c.getMeRaw(ctx)
 	if errors.Is(err, ErrUnauthorized) && c.canRelogin() {
 		c.invalidateAuth()

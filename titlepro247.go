@@ -11,6 +11,7 @@
 package titlepro247
 
 import (
+	"context"
 	"net/http"
 	"net/http/cookiejar"
 	"sync"
@@ -29,6 +30,14 @@ const (
 	// exceeded (Client.Timeout exceeded while awaiting headers)". 60s gives
 	// the upstream room to respond; tune with WithTimeout.
 	defaultTimeout = 60 * time.Second
+	// defaultMaxTotalWait caps the aggregate wall-clock time a single public
+	// entry point (GetMe, Login) may spend across its layered retries. Without
+	// it, the per-attempt 60s timeout stacks: GetMe self-heal (getMeRaw →
+	// relogin → Login, each retrying ~4×60s) nesting with doRetried's own
+	// ~4×60s budget can balloon to ~8 min when the upstream is hard-down. 90s
+	// is a sane ceiling that still allows one slow attempt plus a retry; tune
+	// with WithMaxTotalWait. Override with 0 (or any non-positive) to disable.
+	defaultMaxTotalWait = 90 * time.Second
 )
 
 // Client talks to v3.titlepro247.com.
@@ -39,6 +48,15 @@ type Client struct {
 	maxRetries int
 	retryBase  time.Duration
 	minGap     time.Duration
+
+	// maxTotalWait bounds the aggregate elapsed time across the layered
+	// retries of a single GetMe/Login. <=0 disables the cap.
+	maxTotalWait time.Duration
+
+	// baseOverride, when non-empty, replaces the package baseURL for all
+	// request construction. It is an unexported test seam (see withBaseURL);
+	// production code never sets it, so the public API is unaffected.
+	baseOverride string
 
 	gapMu     sync.Mutex
 	lastReqAt time.Time
@@ -95,6 +113,44 @@ func WithTimeout(d time.Duration) Option {
 	}
 }
 
+// WithMaxTotalWait caps the total wall-clock time a single GetMe or Login may
+// spend across its layered per-attempt timeouts and retries. This prevents the
+// worst case where a 60s per-request timeout stacks across nested retries
+// (e.g. GetMe's self-heal driving a relogin that itself retries) into a
+// multi-minute hang when the upstream is hard-down. A tighter caller-provided
+// context deadline still wins (the earlier of the two applies). A non-positive
+// value disables the cap. The default is 90s.
+func WithMaxTotalWait(d time.Duration) Option {
+	return func(c *Client) { c.maxTotalWait = d }
+}
+
+// withBaseURL overrides the upstream base URL. Unexported on purpose: it is a
+// test-only seam (point the client at an httptest.Server) and is NOT part of
+// the public API.
+func withBaseURL(u string) Option {
+	return func(c *Client) { c.baseOverride = u }
+}
+
+// base returns the effective upstream base URL (test override or the default).
+func (c *Client) base() string {
+	if c.baseOverride != "" {
+		return c.baseOverride
+	}
+	return baseURL
+}
+
+// capContext derives a context bounded by maxTotalWait so per-attempt timeouts
+// and retries cannot stack into minutes. context.WithTimeout already honors a
+// tighter parent deadline (the earlier of the two wins), so a caller-supplied
+// deadline is respected. When the cap is disabled (<=0) the parent is returned
+// unchanged with a no-op cancel.
+func (c *Client) capContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.maxTotalWait <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.maxTotalWait)
+}
+
 // WithHTTPClient overrides the default http.Client. Nil is ignored.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) {
@@ -136,12 +192,13 @@ func New(auth Auth, opts ...Option) (*Client, error) {
 	}
 	jar, _ := cookiejar.New(nil)
 	c := &Client{
-		auth:       auth,
-		httpClient: &http.Client{Timeout: defaultTimeout, Jar: jar},
-		userAgent:  defaultUserAgent,
-		maxRetries: defaultRetries,
-		retryBase:  defaultRetryBase,
-		minGap:     400 * time.Millisecond,
+		auth:         auth,
+		httpClient:   &http.Client{Timeout: defaultTimeout, Jar: jar},
+		userAgent:    defaultUserAgent,
+		maxRetries:   defaultRetries,
+		retryBase:    defaultRetryBase,
+		minGap:       400 * time.Millisecond,
+		maxTotalWait: defaultMaxTotalWait,
 	}
 	for _, o := range opts {
 		o(c)
