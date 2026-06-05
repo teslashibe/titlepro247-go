@@ -27,10 +27,10 @@ All paths below are relative to `https://v3.titlepro247.com/`.
 |--------|------|---------|---------------|
 | GET  | `Areas/PDV/api/PDVData/` | Address → parcel rows (APN, owner, use, lat/long, FIPS) | `keyword, location, searchText, pdvSearchType=1, rows, page, …` |
 | GET  | `Areas/PDV/api/PDVAPI/Autocomplete/?term=` | Address autocomplete | `term` |
-| POST | `Areas/PDV/api/CompsData/PostCompsData` | Subject + nearby **sales/MLS comps** (SqFt, SalePrice, SaleDate) | criteria `{fips, apn, BillingTypeID, …filters}` → `{standard, distressed, listings, sales[], mls[], fips, apn, mapurl}` |
-| POST | `Areas/PDV/api/HistoryData/PostHistoryData/` | Initiate a transfer/history search | `{SearchType, Keyword, Location, State, FIPS, City, Zip}` → `{success}` |
-| GET  | `Areas/PDV/api/HistoryData/GetHistoryData/{key}` | Retrieve search history options | path key |
-| GET  | `Areas/PDV/api/PDVAPI/SearchLienAlert` | Lien alert search | query |
+| POST | `Areas/PDV/api/CompsData/PostCompsData` | Subject + nearby **sales/MLS comps** (SqFt, SalePrice, SaleDate) | criteria `{fips, apn, BillingTypeID, …filters}` → `{standard, distressed, listings, sales[], mls[], fips, apn, mapurl}`. **Returns empty `sales[]`/`mls[]` with `PID:0`/`orderid:null` when criteria are incomplete (#133).** The browser sends the `GetFilter` criteria object merged with `{apn, fips}`; the typed `GetComps` helper replicates that. `BillingTypeID`'s correct value is **unconfirmed (needs live HAR capture)**. |
+| POST | `Areas/PDV/api/HistoryData/PostHistoryData/` | Step 1 of history: initiate a transfer/history search, returns a session key | `{SearchType, Keyword, Location, State, FIPS, City, Zip}` → `{success, key?}`. **The `{fips, apn}`→body mapping and the returned key field name are unconfirmed (needs live HAR capture).** |
+| GET  | `Areas/PDV/api/HistoryData/GetHistoryData/{key}` | Step 2 of history: fetch results for the key from step 1 | path key. The typed `GetHistory` helper chains both steps in one call so the key can't expire between invocations. |
+| GET  | `Areas/PDV/api/PDVAPI/SearchLienAlert` | Lien alert search | query — **exact param names not fully documented**; the typed `GetLiens` helper sends `fips`+`apn` as a best guess (needs live HAR capture to confirm). |
 | GET  | `Areas/PDV/api/PDVAPI/GetUserInfo` | Current user info | — |
 | GET  | `Areas/PDV/api/PDVAPI/GetZoneList` | Zoning list | — |
 | GET  | `Areas/PDV/api/PDVAPI/GetFilter` | Saved comps filter | — |
@@ -43,8 +43,27 @@ All paths below are relative to `https://v3.titlepro247.com/`.
 | GET  | `Areas/Lists/api/ListsData/GetPins` | Map pins | query |
 | GET  | `Areas/Orders/api/OrdersData/GetStatus/{id}` | Order status | path id |
 | GET  | `Areas/DocumentRetrieval/api/DocumentData/GetAvailableDocuments` | Available title docs | query |
-| GET  | `PDV/Home/StandardizeAddress` | Normalize an address | `address, lastline` |
+| GET  | `PDV/Home/StandardizeAddress` | Normalize an address | **GET + querystring** `?address=...&lastline=...` (NOT POST + body — a POST with a JSON body returns HTTP 200 with an empty body, #134). Use the typed `StandardizeAddress` helper. |
 | GET  | `PDV/Home/GetUserProducts` | Products the account can order | — |
+
+## Typed convenience methods (client + MCP tools)
+
+Rather than hand-crafting paths/bodies through `CallPDVAPI` / `titlepro247_pdv_api`,
+prefer the typed helpers, which validate inputs and chain multi-step flows:
+
+| Method / MCP tool | Wraps | Notes |
+|---|---|---|
+| `StandardizeAddress(ctx, address, lastline)` / `titlepro247_standardize_address` | `GET PDV/Home/StandardizeAddress` | GET + querystring (fixes #134). |
+| `GetComps(ctx, fips, apn)` / `titlepro247_get_comps` | `GET GetFilter` → `POST PostCompsData` | Merges saved filter criteria with `{apn, fips}` (Hypothesis A, #133). |
+| `GetHistory(ctx, fips, apn)` / `titlepro247_get_history` | `POST PostHistoryData` → `GET GetHistoryData/{key}` | Chains both steps in one call (#135). |
+| `GetLiens(ctx, fips, apn)` / `titlepro247_get_liens` | `GET SearchLienAlert` | Best-guess `fips`+`apn` query params (#135). |
+
+`CallPDVAPI`/`PDVAPIResult` now set `empty_body: true` and `raw: "(empty body)"`
+when the server returns an empty body, so a silent empty 200 is no longer
+dropped by `omitempty` (#134).
+
+Items marked "needs live HAR capture" above cannot be finalized without live
+TitlePro247 credentials and a browser network capture of the real request.
 
 ## Mutating / order / billing endpoints (BLOCKED by the client)
 

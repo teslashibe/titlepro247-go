@@ -74,6 +74,76 @@ func (c *Client) searchAddressOnce(ctx context.Context, keyword, location string
 	return out, nil
 }
 
+// StandardizeAddress normalizes/parses a free-form address via the PDV home
+// endpoint — the same call the website's search box fires to canonicalize what
+// the user typed:
+//
+//	GET /PDV/Home/StandardizeAddress?address=...&lastline=...
+//
+// IMPORTANT: this endpoint is GET + querystring, NOT POST + JSON body. Issuing
+// a POST with a JSON body returns HTTP 200 with an empty body (the server
+// silently ignores the body), which is the root cause of #134. We mirror the
+// SearchAddress typed method exactly (GET, anti-forgery token, self-heal).
+//
+// address is the street line ("1524 Abbot Kinney Blvd"); lastline is the USPS
+// last line ("Venice, CA 90291"). Returns the parsed JSON payload when present.
+//
+// NOTE (needs live capture to finalize): the exact response schema is not
+// documented. We keep the raw payload and a parsed view so the full response
+// reaches the caller regardless of shape. If a live capture shows this endpoint
+// returns nothing beyond what SearchAddress already provides, consider
+// deprecating it from the allowlist (see #134 open questions).
+func (c *Client) StandardizeAddress(ctx context.Context, address, lastline string) (*StandardizeAddressResult, error) {
+	res, err := c.standardizeAddressOnce(ctx, address, lastline)
+	if isUnauthorized(err) && c.canRelogin() {
+		c.invalidateAuth()
+		if lerr := c.relogin(ctx); lerr != nil {
+			return nil, lerr
+		}
+		res, err = c.standardizeAddressOnce(ctx, address, lastline)
+	}
+	return res, err
+}
+
+func (c *Client) standardizeAddressOnce(ctx context.Context, address, lastline string) (*StandardizeAddressResult, error) {
+	if strings.TrimSpace(address) == "" {
+		return nil, fmt.Errorf("%w: address is required", ErrInvalidParams)
+	}
+	if err := c.ensureLoggedIn(ctx); err != nil {
+		return nil, err
+	}
+	token := c.antiForgeryToken(ctx) // best-effort; empty is tolerated
+
+	q := url.Values{}
+	q.Set("address", address)
+	q.Set("lastline", lastline)
+
+	raw, status, err := c.getJSONWithToken(ctx, "/PDV/Home/StandardizeAddress?"+q.Encode(), token)
+	if err != nil {
+		return nil, err
+	}
+	out := &StandardizeAddressResult{StatusCode: status, Address: address, LastLine: lastline}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		out.EmptyBody = true
+		out.Raw = "(empty body)"
+		return out, nil
+	}
+	if err := json.Unmarshal(raw, &out.Data); err != nil {
+		out.Raw = string(raw)
+	}
+	return out, nil
+}
+
+// StandardizeAddressResult is the envelope returned by StandardizeAddress.
+type StandardizeAddressResult struct {
+	Address    string `json:"address"`
+	LastLine   string `json:"lastline"`
+	StatusCode int    `json:"status_code"`
+	Data       any    `json:"data,omitempty"`
+	Raw        string `json:"raw,omitempty"`
+	EmptyBody  bool   `json:"empty_body,omitempty"`
+}
+
 // PDVSearchResult is the envelope returned by SearchAddress.
 type PDVSearchResult struct {
 	Keyword    string   `json:"keyword"`

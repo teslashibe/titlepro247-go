@@ -17,6 +17,14 @@ type PDVAPIResult struct {
 	StatusCode int    `json:"status_code"`
 	Data       any    `json:"data,omitempty"`
 	Raw        string `json:"raw,omitempty"`
+	// EmptyBody is true when the server answered (often HTTP 200) with a
+	// completely empty response body. Several SiteX endpoints silently return
+	// an empty 200 when called with the wrong method/shape (e.g. POSTing to a
+	// GET+querystring endpoint like PDV/Home/StandardizeAddress, see #134).
+	// We surface this explicitly so the caller/agent sees *something* instead
+	// of a result that — because Raw/Data are omitempty — only carries
+	// method/path/status_code and looks like a silent success.
+	EmptyBody bool `json:"empty_body,omitempty"`
 }
 
 // pdvReadAllowlist is the set of authenticated READ/search endpoints an agent
@@ -121,6 +129,13 @@ func (c *Client) callPDVAPIOnce(ctx context.Context, method, reqPath string, bod
 		return nil, err
 	}
 	out := &PDVAPIResult{Method: method, Path: reqPath, StatusCode: status}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		// Empty 200 is a common silent failure mode (wrong method/shape).
+		// Make it visible instead of letting omitempty drop it. See #134.
+		out.EmptyBody = true
+		out.Raw = "(empty body)"
+		return out, nil
+	}
 	var parsed any
 	if json.Unmarshal(raw, &parsed) == nil {
 		out.Data = parsed
