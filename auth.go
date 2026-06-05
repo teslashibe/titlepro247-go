@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Login posts UserName + Password to /Index.aspx exactly the way the
@@ -51,6 +52,7 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 	}
 
 	var resp *http.Response
+	transient := 0
 	for rotations := 0; ; rotations++ {
 		req, err := buildReq()
 		if err != nil {
@@ -68,8 +70,20 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 		}
 		// Transport failure (timeout / refused): rotate the egress IP and
 		// retry. When no proxy is configured or the budget is spent,
-		// rotateProxy returns false and we surface the login error.
+		// rotateProxy returns false.
 		if c.rotateProxy(rotations) {
+			continue
+		}
+		// No proxy (or its budget is spent): the slow TitlePro247 upstream
+		// often just times out awaiting headers. Retry a bounded number of
+		// times with backoff before surfacing the login error.
+		if transient < c.maxRetries {
+			transient++
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("%w: %v", ErrLoginFailed, ctx.Err())
+			case <-time.After(c.backoff(transient)):
+			}
 			continue
 		}
 		return nil, fmt.Errorf("%w: %v", ErrLoginFailed, derr)

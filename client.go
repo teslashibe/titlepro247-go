@@ -77,12 +77,17 @@ func (c *Client) doRetried(ctx context.Context, method, rawURL string, body []by
 		// suggests a dead or banned egress IP. When a residential proxy is
 		// configured, rotate to a fresh sticky session and retry without
 		// consuming the normal retry budget.
-		if (is5xx || errors.Is(err, ErrRequestFailed)) && c.rotateProxy(rotations) {
+		transient := is5xx || errors.Is(err, ErrRequestFailed)
+		if transient && c.rotateProxy(rotations) {
 			rotations++
 			attempt--
 			continue
 		}
-		if is5xx {
+		// Transient failures (upstream 5xx or a transport-level error such as
+		// a request timeout against the slow TitlePro247 upstream) are worth
+		// retrying within the normal retry budget with backoff. Auth failures
+		// (ErrUnauthorized) and other non-2xx HTTP errors are not retried.
+		if transient {
 			continue
 		}
 		return nil, status, err

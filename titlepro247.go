@@ -23,6 +23,12 @@ const (
 	defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	defaultRetries   = 3
 	defaultRetryBase = 500 * time.Millisecond
+	// defaultTimeout is the per-request HTTP timeout. v3.titlepro247.com
+	// (ICE/SiteX) is a slow upstream whose /Index.aspx and /Account pages
+	// routinely take >30s to answer headers, surfacing as "context deadline
+	// exceeded (Client.Timeout exceeded while awaiting headers)". 60s gives
+	// the upstream room to respond; tune with WithTimeout.
+	defaultTimeout = 60 * time.Second
 )
 
 // Client talks to v3.titlepro247.com.
@@ -76,6 +82,19 @@ func WithRetry(maxRetries int, base time.Duration) Option {
 	}
 }
 
+// WithTimeout sets the per-request HTTP timeout on the default client. A
+// non-positive value is ignored (timeout left at its default). For a slow
+// upstream, prefer a higher value; the default is already 60s. If a custom
+// client is supplied via WithHTTPClient after this option, that client's own
+// Timeout wins, so apply WithTimeout last (or set Timeout on the custom client).
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) {
+		if d > 0 && c.httpClient != nil {
+			c.httpClient.Timeout = d
+		}
+	}
+}
+
 // WithHTTPClient overrides the default http.Client. Nil is ignored.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) {
@@ -118,7 +137,7 @@ func New(auth Auth, opts ...Option) (*Client, error) {
 	jar, _ := cookiejar.New(nil)
 	c := &Client{
 		auth:       auth,
-		httpClient: &http.Client{Timeout: 30 * time.Second, Jar: jar},
+		httpClient: &http.Client{Timeout: defaultTimeout, Jar: jar},
 		userAgent:  defaultUserAgent,
 		maxRetries: defaultRetries,
 		retryBase:  defaultRetryBase,
