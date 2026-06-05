@@ -27,13 +27,13 @@ All paths below are relative to `https://v3.titlepro247.com/`.
 |--------|------|---------|---------------|
 | GET  | `Areas/PDV/api/PDVData/` | Address → parcel rows (APN, owner, use, lat/long, FIPS) | `keyword, location, searchText, pdvSearchType=1, rows, page, …` |
 | GET  | `Areas/PDV/api/PDVAPI/Autocomplete/?term=` | Address autocomplete | `term` |
-| POST | `Areas/PDV/api/CompsData/PostCompsData` | Subject + nearby **sales/MLS comps** (SqFt, SalePrice, SaleDate) | criteria `{fips, apn, BillingTypeID, …filters}` → `{standard, distressed, listings, sales[], mls[], fips, apn, mapurl}`. **Returns empty `sales[]`/`mls[]` with `PID:0`/`orderid:null` when criteria are incomplete (#133).** The browser sends the `GetFilter` criteria object merged with `{apn, fips}`; the typed `GetComps` helper replicates that. `BillingTypeID`'s correct value is **unconfirmed (needs live HAR capture)**. |
+| POST | `Areas/PDV/api/CompsData/PostCompsData` | Subject + nearby **sales/MLS comps** (SqFt, SalePrice, SaleDate) | criteria `{fips, apn, …}` → `{standard, distressed, listings, sales[], mls[], fips, apn, mapurl}`. **VERIFIED (#133): returns empty `sales[]`/`mls[]` with `PID:0`/`orderid:null` for every body shape (bare, +BillingTypeID, +radius/monthsBack, +GetFilter criteria). The parcel has no order context (PID 0); comps are served only against a real order minted by the blocked order endpoints, so comps are not retrievable on the read-only surface for this account tier.** |
 | POST | `Areas/PDV/api/HistoryData/PostHistoryData/` | Step 1 of history: initiate a transfer/history search, returns a session key | `{SearchType, Keyword, Location, State, FIPS, City, Zip}` → `{success, key?}`. **The `{fips, apn}`→body mapping and the returned key field name are unconfirmed (needs live HAR capture).** |
 | GET  | `Areas/PDV/api/HistoryData/GetHistoryData/{key}` | Step 2 of history: fetch results for the key from step 1 | path key. The typed `GetHistory` helper chains both steps in one call so the key can't expire between invocations. |
-| GET  | `Areas/PDV/api/PDVAPI/SearchLienAlert` | Lien alert search | query — **exact param names not fully documented**; the typed `GetLiens` helper sends `fips`+`apn` as a best guess (needs live HAR capture to confirm). |
-| GET  | `Areas/PDV/api/PDVAPI/GetUserInfo` | Current user info | — |
+| POST | `Areas/PDV/api/PDVAPI/SearchLienAlert` | Lien alert status | **VERIFIED (#135): POST (GET → 405).** `{fips, apn}` → `{"Alerts":"1","IsTPUser":true,"Status":"1"}` — an alert count/flag, not itemized liens. The typed `GetLiens` helper wraps this. |
+| POST | `Areas/PDV/api/PDVAPI/GetUserInfo` | Current user info | **POST (GET → 405).** |
 | GET  | `Areas/PDV/api/PDVAPI/GetZoneList` | Zoning list | — |
-| GET  | `Areas/PDV/api/PDVAPI/GetFilter` | Saved comps filter | — |
+| POST | `Areas/PDV/api/PDVAPI/GetFilter` | Saved comps filter | **POST (GET → 405).** Returns an empty body for this account. |
 | GET  | `Areas/PDV/api/PDVAPI/GetResultsByShape` | Map-shape parcel results | query |
 | GET  | `Areas/PDV/api/PDVAPI/GetCoverSheet/{id}` | Report cover sheet | path id |
 | GET  | `Areas/PDV/api/PDVAPI/GetOpenOrderDetails/{id}` | Open order details | path id |
@@ -54,9 +54,9 @@ prefer the typed helpers, which validate inputs and chain multi-step flows:
 | Method / MCP tool | Wraps | Notes |
 |---|---|---|
 | `StandardizeAddress(ctx, address, lastline)` / `titlepro247_standardize_address` | `GET PDV/Home/StandardizeAddress` | GET + querystring (fixes #134). |
-| `GetComps(ctx, fips, apn)` / `titlepro247_get_comps` | `GET GetFilter` → `POST PostCompsData` | Merges saved filter criteria with `{apn, fips}` (Hypothesis A, #133). |
+| `GetComps(ctx, fips, apn)` / `titlepro247_get_comps` | `POST GetFilter` → `POST PostCompsData` | Issues the correct calls; returns empty read-only (verified order-context gate, #133). |
 | `GetHistory(ctx, fips, apn)` / `titlepro247_get_history` | `POST PostHistoryData` → `GET GetHistoryData/{key}` | Chains both steps in one call (#135). |
-| `GetLiens(ctx, fips, apn)` / `titlepro247_get_liens` | `GET SearchLienAlert` | Best-guess `fips`+`apn` query params (#135). |
+| `GetLiens(ctx, fips, apn)` / `titlepro247_get_liens` | `POST SearchLienAlert` | Returns lien-alert count/flag `{Alerts,Status}` (verified, #135). |
 
 `CallPDVAPI`/`PDVAPIResult` now set `empty_body: true` and `raw: "(empty body)"`
 when the server returns an empty body, so a silent empty 200 is no longer

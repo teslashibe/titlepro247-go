@@ -34,21 +34,25 @@ type CompsResult struct {
 // GetComps retrieves comparable sales/MLS listings for a parcel identified by
 // fips + apn (both from SearchAddress).
 //
-// Design (Hypothesis A, see #133): PostCompsData returns an empty result set
-// with PID:0 / orderid:null when the criteria body is missing required filter
-// fields (most notably BillingTypeID). The SiteX Angular front-end always sends
-// the criteria object returned by GET .../GetFilter alongside {apn, fips}, so
-// we replicate that: fetch the saved filter first, merge {apn, fips} into it,
-// then POST. This is the verifiable-without-live-creds part. The actual
-// non-emptiness of the result can only be confirmed with live credentials on a
-// high-activity parcel (see #133 acceptance criteria).
+// Flow: POST .../GetFilter (the saved criteria the browser merges in) → merge
+// {apn, fips} → POST .../PostCompsData.
 //
-// TODO(needs live HAR capture, #133): confirm the exact required fields. In
-// particular BillingTypeID — its correct value for a standard residential comps
-// request is unknown. We deliberately do NOT inject a magic value; if GetFilter
-// supplies it, it flows through the merge. If GetFilter does not include it,
-// the merged body still omits it and the response may remain empty — that gap
-// is documented rather than guessed.
+// VERIFIED UPSTREAM LIMITATION (#133, confirmed via live probing on parcel
+// 06037/4238-005-027, Venice CA): PostCompsData returns HTTP 200 with
+// sales:[]/mls:[] and PID:0/orderid:null for *every* body shape tried — bare
+// {apn,fips}, with BillingTypeID 0/1, with radius/monthsBack/maxComps, and with
+// the GetFilter criteria merged in. GetFilter itself (POST) returns an empty
+// body for this account, so there is no criteria object to merge. The PID:0 in
+// both the parcel search row and the comps response indicates SiteX never
+// resolves an *order context* for the parcel; comps are served only against a
+// real order (PID), which is minted by the blocked order/cart endpoints. So
+// comparable sales are NOT retrievable through the read-only surface for this
+// account tier. This helper issues the correct calls and returns the (empty)
+// response verbatim; it does not fabricate data. Closing #133 fully requires
+// either a sanctioned order-seeding endpoint or a higher account tier.
+//
+// NOTE: GetFilter is a POST endpoint (a GET returns HTTP 405 "resource does not
+// support http method 'GET'"); earlier docs/this helper using GET were wrong.
 func (c *Client) GetComps(ctx context.Context, fips, apn string) (*CompsResult, error) {
 	if strings.TrimSpace(fips) == "" || strings.TrimSpace(apn) == "" {
 		return nil, fmt.Errorf("%w: both fips and apn are required", ErrInvalidParams)
@@ -57,9 +61,9 @@ func (c *Client) GetComps(ctx context.Context, fips, apn string) (*CompsResult, 
 	out := &CompsResult{FIPS: fips, APN: apn}
 
 	// Step 1: fetch the saved comps filter (default criteria the browser sends).
-	// Best-effort: if it fails or returns a non-object, we fall back to a
-	// minimal {apn, fips} body and document the gap.
-	filterRes, ferr := c.CallPDVAPI(ctx, "GET", pathGetFilter, nil)
+	// POST, not GET. Best-effort: if it fails or returns a non-object/empty
+	// body, we fall back to a minimal {apn, fips} body.
+	filterRes, ferr := c.CallPDVAPI(ctx, "POST", pathGetFilter, nil)
 	criteria := map[string]any{}
 	if ferr == nil && filterRes != nil {
 		out.Filter = filterRes.Data
@@ -101,27 +105,34 @@ type HistoryResult struct {
 	History  *PDVAPIResult  `json:"history,omitempty"`
 }
 
-// GetHistory retrieves sale/transfer history for a parcel. This is a two-step
-// flow (see #135): POST .../PostHistoryData to initiate a search and obtain a
-// session {key}, then GET .../GetHistoryData/{key} to fetch the results. We
-// chain both in one call so the key cannot expire between MCP invocations.
+// GetHistory retrieves sale/transfer history for a parcel. Two-step flow
+// (#135): POST .../PostHistoryData initiates the search, then
+// GET .../GetHistoryData/{key} fetches results. We chain both in one call.
 //
-// TODO(needs live HAR capture, #133/#135): the documented PostHistoryData body
-// is {SearchType, Keyword, Location, State, FIPS, City, Zip} and does NOT
-// include apn directly. The mapping from {fips, apn} onto this body is a best
-// guess: we send FIPS and place apn in Keyword. The correct SearchType value
-// and whether apn belongs in Keyword are unconfirmed. We also do not know the
-// exact field name of the returned key, so extractHistoryKey tries the common
-// candidates and the helper returns the raw Initiate response either way.
+// VERIFIED (#135, live probing): the documented body shape
+// {SearchType, Keyword, Location, State, FIPS, City, Zip} is correct — with it,
+// PostHistoryData returns HTTP 200 {"success":true} (a bare {fips,apn} body
+// returns HTTP 500). However the initiate response contains ONLY {success:true}
+// — no session key — and GetHistoryData/{key} returns HTTP 400 "request is
+// invalid" for every key we can derive (apn, fips+apn, etc.). The real key is
+// an opaque server token surfaced only to the browser, so transfer-history
+// RESULTS are not retrievable through the read-only surface. This helper
+// performs the (successful) initiate step and returns it; result retrieval is
+// gated upstream and documented rather than guessed.
 func (c *Client) GetHistory(ctx context.Context, fips, apn string) (*HistoryResult, error) {
 	if strings.TrimSpace(fips) == "" || strings.TrimSpace(apn) == "" {
 		return nil, fmt.Errorf("%w: both fips and apn are required", ErrInvalidParams)
 	}
 
+	// Documented + verified body shape (SearchType 1 = APN search).
 	body := map[string]any{
-		// TODO(live capture): confirm SearchType value + field mapping.
-		"FIPS":    fips,
-		"Keyword": apn,
+		"SearchType": 1,
+		"Keyword":    apn,
+		"FIPS":       fips,
+		"Location":   "",
+		"State":      "",
+		"City":       "",
+		"Zip":        "",
 	}
 	out := &HistoryResult{FIPS: fips, APN: apn, Body: body}
 
@@ -181,27 +192,28 @@ type LiensResult struct {
 	Liens *PDVAPIResult `json:"liens"`
 }
 
-// GetLiens retrieves open lien/mortgage records for a parcel via the
-// allowlisted GET .../SearchLienAlert endpoint (see #135).
+// GetLiens checks the lien-alert status for a parcel via the allowlisted
+// .../SearchLienAlert endpoint (see #135).
 //
-// TODO(needs live HAR capture, #135): the exact query-parameter shape is
-// undocumented ("query params not fully documented" in API.md). We send fips
-// and apn as the most likely parameters; the real parameter names (e.g.
-// parcelId, or a combined keyword) must be reverse-engineered from a live
-// browser session before this can be confirmed to return records.
+// VERIFIED (#135, live probing): SearchLienAlert is a POST endpoint (a GET
+// returns HTTP 405). POSTing {fips, apn} returns HTTP 200 with an alert summary,
+// e.g. {"Alerts":"1","IsTPUser":true,"Status":"1"} — i.e. a count/flag of
+// lien alerts on the parcel, not itemized lien records. The itemized-detail
+// endpoint (GetLienAlert) is intentionally outside pdvReadAllowlist. So this
+// helper returns the lien-alert summary (presence + count); full lien detail is
+// not available on the read-only surface.
 func (c *Client) GetLiens(ctx context.Context, fips, apn string) (*LiensResult, error) {
 	if strings.TrimSpace(fips) == "" || strings.TrimSpace(apn) == "" {
 		return nil, fmt.Errorf("%w: both fips and apn are required", ErrInvalidParams)
 	}
 
-	q := url.Values{}
-	q.Set("fips", fips)
-	q.Set("apn", apn)
-	query := q.Encode()
-
-	res, err := c.CallPDVAPI(ctx, "GET", pathSearchLienAlert+"?"+query, nil)
+	body, err := json.Marshal(map[string]any{"fips": fips, "apn": apn})
+	if err != nil {
+		return nil, fmt.Errorf("%w: marshal liens body: %v", ErrInvalidParams, err)
+	}
+	res, err := c.CallPDVAPI(ctx, "POST", pathSearchLienAlert, body)
 	if err != nil {
 		return nil, err
 	}
-	return &LiensResult{FIPS: fips, APN: apn, Query: query, Liens: res}, nil
+	return &LiensResult{FIPS: fips, APN: apn, Query: "POST {fips,apn}", Liens: res}, nil
 }
