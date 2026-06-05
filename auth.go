@@ -35,22 +35,44 @@ func (c *Client) Login(ctx context.Context) (*User, error) {
 	form.Set("RememberMe", "false")
 	form.Set("View", "")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+loginPath,
-		strings.NewReader(form.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidParams, err)
+	// Login bypasses doRetried (it disables redirects to capture the cookie
+	// cleanly), so it carries its own residential-proxy rotation: a login
+	// against a dead/banned datacenter egress IP times out at the transport
+	// layer, and rotating to a fresh sticky session is exactly what recovers
+	// it. Bounded by the configured rotation budget (no-op when unproxied).
+	buildReq := func() (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+loginPath,
+			strings.NewReader(form.Encode()))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidParams, err)
+		}
+		c.setCommonHeaders(r, "application/x-www-form-urlencoded")
+		return r, nil
 	}
-	c.setCommonHeaders(req, "application/x-www-form-urlencoded")
 
-	noRedir := *c.httpClient
-	noRedir.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	c.waitForGap(ctx)
-	resp, err := noRedir.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrLoginFailed, err)
+	var resp *http.Response
+	for rotations := 0; ; rotations++ {
+		req, err := buildReq()
+		if err != nil {
+			return nil, err
+		}
+		noRedir := *c.httpClient
+		noRedir.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		c.waitForGap(ctx)
+		r, derr := noRedir.Do(req)
+		if derr == nil {
+			resp = r
+			break
+		}
+		// Transport failure (timeout / refused): rotate the egress IP and
+		// retry. When no proxy is configured or the budget is spent,
+		// rotateProxy returns false and we surface the login error.
+		if c.rotateProxy(rotations) {
+			continue
+		}
+		return nil, fmt.Errorf("%w: %v", ErrLoginFailed, derr)
 	}
 	defer resp.Body.Close()
 	c.captureAuthCookie(resp)

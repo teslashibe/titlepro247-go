@@ -53,6 +53,7 @@ func (c *Client) getBytesHealing(ctx context.Context, path string, query url.Val
 
 func (c *Client) doRetried(ctx context.Context, method, rawURL string, body []byte, contentType string) ([]byte, int, error) {
 	var lastErr error
+	rotations := 0
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
 			wait := c.backoff(attempt)
@@ -71,12 +72,64 @@ func (c *Client) doRetried(ctx context.Context, method, rawURL string, body []by
 			continue
 		}
 		var httpErr *HTTPError
-		if errors.As(err, &httpErr) && httpErr.StatusCode >= 500 {
+		is5xx := errors.As(err, &httpErr) && httpErr.StatusCode >= 500
+		// A transport failure (timeout / connection refused) or a proxy 5xx
+		// suggests a dead or banned egress IP. When a residential proxy is
+		// configured, rotate to a fresh sticky session and retry without
+		// consuming the normal retry budget.
+		if (is5xx || errors.Is(err, ErrRequestFailed)) && c.rotateProxy(rotations) {
+			rotations++
+			attempt--
+			continue
+		}
+		if is5xx {
 			continue
 		}
 		return nil, status, err
 	}
 	return nil, 0, lastErr
+}
+
+// rotateProxy advances to the next sticky residential session and rebuilds the
+// transport so the next request uses a fresh IP. Returns false (no rotation)
+// when no proxy is configured, the rotation budget is exhausted, or the
+// provider returns no URL for the next session.
+func (c *Client) rotateProxy(done int) bool {
+	if c.proxyFunc == nil || done >= c.maxProxyRotations {
+		return false
+	}
+	c.proxyMu.Lock()
+	c.proxySession++
+	session := c.proxySession
+	c.proxyMu.Unlock()
+	return c.applyProxy(session)
+}
+
+// applyProxy points the client's transport at the proxy URL for the given
+// sticky session. Returns false when the provider yields no URL or it can't be
+// parsed (the caller then stops rotating). Clones the existing transport so a
+// caller-supplied http.Client keeps its other settings.
+func (c *Client) applyProxy(session int) bool {
+	if c.proxyFunc == nil || c.httpClient == nil {
+		return false
+	}
+	raw := c.proxyFunc(session)
+	if raw == "" {
+		return false
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	var tr *http.Transport
+	if existing, ok := c.httpClient.Transport.(*http.Transport); ok && existing != nil {
+		tr = existing.Clone()
+	} else {
+		tr = http.DefaultTransport.(*http.Transport).Clone()
+	}
+	tr.Proxy = http.ProxyURL(parsed)
+	c.httpClient.Transport = tr
+	return true
 }
 
 func (c *Client) ensureLoggedIn(ctx context.Context) error {

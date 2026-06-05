@@ -43,7 +43,24 @@ type Client struct {
 	loginMu sync.Mutex
 
 	authMu sync.RWMutex
+
+	// Residential proxy rotation. proxyFunc maps a sticky-session number
+	// (starting at 1) to a proxy URL; when set, the client routes through
+	// the returned proxy and, on a transport-level failure, advances to the
+	// next session (a fresh residential IP) and retries — up to
+	// maxProxyRotations times. nil proxyFunc = no proxying.
+	proxyFunc         ProxyURLForSession
+	maxProxyRotations int
+	proxySession      int
+	proxyMu           sync.Mutex
 }
+
+// ProxyURLForSession maps a sticky-session number to a proxy URL. Session
+// numbering starts at 1 and increments on each rotation; a residential
+// gateway allocates a distinct IP per session, so returning a URL whose
+// session component reflects the argument yields a fresh IP on rotation.
+// Return "" to signal "no proxy for this session" (rotation then stops).
+type ProxyURLForSession func(session int) string
 
 // Option configures a Client.
 type Option func(*Client)
@@ -73,6 +90,25 @@ func WithMinRequestGap(d time.Duration) Option {
 	return func(c *Client) { c.minGap = d }
 }
 
+// WithResidentialProxy routes every request through a residential proxy and
+// self-heals stale IPs. fn maps a sticky-session number (starting at 1) to a
+// proxy URL; on a transport-level failure (connection timeout, refused, or a
+// proxy 5xx) the client advances to the next session — a fresh residential IP
+// from the provider's pool — and retries, up to maxRotations times per call.
+//
+// This exists because some upstreams (TitlePro247 / ICE SiteX) silently drop
+// datacenter egress IPs, so a server-side login times out while the same
+// credentials work from a residential IP. Passing a nil fn disables proxying.
+func WithResidentialProxy(fn ProxyURLForSession, maxRotations int) Option {
+	return func(c *Client) {
+		c.proxyFunc = fn
+		if maxRotations < 0 {
+			maxRotations = 0
+		}
+		c.maxProxyRotations = maxRotations
+	}
+}
+
 // New constructs a Client. Either (Username + Password) or AuthCookie
 // must be supplied.
 func New(auth Auth, opts ...Option) (*Client, error) {
@@ -90,6 +126,13 @@ func New(auth Auth, opts ...Option) (*Client, error) {
 	}
 	for _, o := range opts {
 		o(c)
+	}
+	// Route the initial requests through the first sticky session when a
+	// residential proxy is configured. Rotation (on failure) bumps the
+	// session in doRetried.
+	if c.proxyFunc != nil {
+		c.proxySession = 1
+		c.applyProxy(1)
 	}
 	// A stored cookie (Auth.AuthCookie, e.g. the host's persisted session)
 	// must live in the jar to be sent; a fresh login populates the jar itself.
