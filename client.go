@@ -17,7 +17,7 @@ import (
 
 // getBytes fetches a path under baseURL and returns raw body.
 func (c *Client) getBytes(ctx context.Context, path string, query url.Values) ([]byte, int, error) {
-	full := baseURL + path
+	full := c.base() + path
 	if len(query) > 0 {
 		full += "?" + query.Encode()
 	}
@@ -52,6 +52,15 @@ func (c *Client) getBytesHealing(ctx context.Context, path string, query url.Val
 }
 
 func (c *Client) doRetried(ctx context.Context, method, rawURL string, body []byte, contentType string) ([]byte, int, error) {
+	// Only idempotent requests may be transparently replayed on a transient
+	// failure (transport timeout / 5xx). Replaying an arbitrary POST on a
+	// headers-timeout could double-submit a side-effecting request, so for
+	// non-idempotent methods we surface the transient error instead of
+	// retrying. Today doRetried is only reached via GET (getBytes), but this
+	// keeps the contract explicit if a POST is ever routed through it.
+	// (Login's POST replay lives in Login itself, where a replay merely
+	// re-mints a session — safe and intentional.)
+	idempotent := method == http.MethodGet || method == http.MethodHead
 	var lastErr error
 	rotations := 0
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
@@ -69,6 +78,9 @@ func (c *Client) doRetried(ctx context.Context, method, rawURL string, body []by
 		}
 		lastErr = err
 		if errors.Is(err, ErrRateLimited) {
+			if !idempotent {
+				return nil, status, err
+			}
 			continue
 		}
 		var httpErr *HTTPError
@@ -77,12 +89,26 @@ func (c *Client) doRetried(ctx context.Context, method, rawURL string, body []by
 		// suggests a dead or banned egress IP. When a residential proxy is
 		// configured, rotate to a fresh sticky session and retry without
 		// consuming the normal retry budget.
-		if (is5xx || errors.Is(err, ErrRequestFailed)) && c.rotateProxy(rotations) {
+		//
+		// ErrRequestFailed here means a genuine transport/timeout failure from
+		// httpClient.Do (see execute); request-BUILD errors (bad method/URL)
+		// are classified as ErrInvalidParams and are NOT transient, so the
+		// retry budget is never burned on a permanent build error.
+		transient := is5xx || errors.Is(err, ErrRequestFailed)
+		// Transient failures are only safe to replay for idempotent requests.
+		if transient && !idempotent {
+			return nil, status, err
+		}
+		if transient && c.rotateProxy(rotations) {
 			rotations++
 			attempt--
 			continue
 		}
-		if is5xx {
+		// Transient failures (upstream 5xx or a transport-level error such as
+		// a request timeout against the slow TitlePro247 upstream) are worth
+		// retrying within the normal retry budget with backoff. Auth failures
+		// (ErrUnauthorized) and other non-2xx HTTP errors are not retried.
+		if transient {
 			continue
 		}
 		return nil, status, err
@@ -191,7 +217,11 @@ func (c *Client) doRequest(ctx context.Context, method, rawURL string, body []by
 	}
 	req, err := http.NewRequestWithContext(ctx, method, rawURL, bodyReader)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: %v", ErrRequestFailed, err)
+		// A request-BUILD failure (bad method/URL) is permanent — it will
+		// never succeed on retry — so classify it as ErrInvalidParams, NOT
+		// the transport-level ErrRequestFailed that doRetried treats as
+		// transient. This keeps the retry budget for genuine transport faults.
+		return nil, 0, fmt.Errorf("%w: %v", ErrInvalidParams, err)
 	}
 	c.setCommonHeaders(req, contentType)
 	return c.execute(ctx, req)
@@ -255,8 +285,8 @@ func (c *Client) setCommonHeaders(req *http.Request, contentType string) {
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Referer", baseURL+"/")
-	req.Header.Set("Origin", baseURL)
+	req.Header.Set("Referer", c.base()+"/")
+	req.Header.Set("Origin", c.base())
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -280,7 +310,7 @@ func (c *Client) seedJar() {
 	if cookie == "" || c.httpClient == nil || c.httpClient.Jar == nil {
 		return
 	}
-	u, err := url.Parse(baseURL)
+	u, err := url.Parse(c.base())
 	if err != nil {
 		return
 	}
@@ -336,9 +366,9 @@ func (c *Client) antiForgeryToken(ctx context.Context) string {
 // surface it as ErrUnauthorized (lets SearchAddress self-heal).
 func (c *Client) getJSONWithToken(ctx context.Context, rawPath, token string) ([]byte, int, error) {
 	build := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+rawPath, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base()+rawPath, nil)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
+			return nil, fmt.Errorf("%w: %v", ErrInvalidParams, err)
 		}
 		c.setCommonHeaders(req, "")
 		req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")

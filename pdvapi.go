@@ -136,9 +136,9 @@ func (c *Client) postJSONWithToken(ctx context.Context, reqPath, token string, b
 		body = json.RawMessage("{}")
 	}
 	build := func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+reqPath, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+reqPath, bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
+			return nil, fmt.Errorf("%w: %v", ErrInvalidParams, err)
 		}
 		c.setCommonHeaders(req, "application/json")
 		req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
